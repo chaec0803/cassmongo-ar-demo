@@ -7,6 +7,7 @@ import { CHARACTERS, createCharacter, createConfetti, createShadow, renderThumbn
 import { CHARACTER_IDS, TAPS_TO_COLLECT, createStore, ensureGame, markStarted, newId, nextGame, registerHit } from "./game.js";
 import { EVENT_NAMES, createLogger } from "./logger.js";
 
+const PLACEMENT = new URLSearchParams(location.search).get("placement") === "side" ? "side" : "transform"; // 기본: 병이 변신
 const LOST_GRACE_MS = 700; // 이 시간 안에 다시 잡히면 '유실'로 보지 않는다 (깜박임으로 로그가 쌓이는 것 방지)
 const SCAN_TIPS_AFTER_MS = 15000;
 
@@ -233,16 +234,20 @@ function setArState(s) {
   if (s === "scanning") {
     badge.textContent = "병 찾는 중";
     title.textContent = "테이블 위 카스 병을 비춰주세요";
-    sub.textContent = "병 전체가 화면에 들어오게 비추면 카스몬이 나타나요.";
+    sub.textContent = PLACEMENT === "transform" ? "병 전체가 화면에 들어오게 비추면 병이 카스몬으로 변신해요." : "병 전체가 화면에 들어오게 비추면 카스몬이 나타나요.";
   } else if (s === "lost") {
     badge.textContent = "다시 찾는 중";
     title.textContent = "카스 병을 다시 비춰주세요";
     sub.textContent = g && g.status === "active" ? `${ch.name} 미션 진행 ${g.taps}/${TAPS_TO_COLLECT} 은(는) 그대로 유지돼요.` : "병을 비추면 캐릭터가 다시 나타나요.";
     $("#tap-dots").classList.toggle("keep", !!(g && g.status === "active"));
+  } else if (s === "transforming") {
+    badge.textContent = "카스 병 발견";
+    title.textContent = "카스 병이 변신하고 있어요!";
+    sub.textContent = "병을 계속 비춰 주세요.";
   } else if (s === "found") {
-    badge.textContent = "캐릭터 발견";
-    title.textContent = `${ch.name} 발견! 캐릭터를 3번 터치하세요`;
-    sub.textContent = g.taps ? `좋아요! ${TAPS_TO_COLLECT - g.taps}번 더 터치하면 획득해요.` : "병 옆의 캐릭터를 직접 눌러야 해요.";
+    badge.textContent = PLACEMENT === "transform" ? "변신 성공" : "캐릭터 발견";
+    title.textContent = PLACEMENT === "transform" ? `카스 병이 ${ch.name}(으)로 변신! 3번 터치하세요` : `${ch.name} 발견! 캐릭터를 3번 터치하세요`;
+    sub.textContent = g.taps ? `좋아요! ${TAPS_TO_COLLECT - g.taps}번 더 터치하면 획득해요.` : "캐릭터를 직접 눌러야 해요.";
   }
   document.querySelectorAll("#tap-dots i").forEach((d, i) => d.classList.toggle("on", !!g && i < g.taps));
 }
@@ -271,6 +276,8 @@ function onRawFound(det) {
     // 유실 유예 시간 안에 다시 잡힘 → 연속 추적으로 본다(로그 없음)
     clearTimeout(track.lostTimer);
     track.lostTimer = 0;
+    // 변신 도중에 잠깐 놓쳤다면(연출이 취소됨) 다시 변신시킨다
+    if (stage && !stage.visible) playReveal();
     return;
   }
   if (track.confirmed) return;
@@ -283,7 +290,8 @@ function onRawFound(det) {
   save();
   const g = state.game;
   if (!character || character.id !== g.character_id) buildStageFor(g.character_id);
-  else if (!track.everFound) character.spawn(t3);
+  // 변신 연출이 끝날 무렵(REVEAL) 캐릭터(그림자 포함 무대 전체)를 보인다. side 모드는 바로 등장
+  stage.visible = false;
   track.loggedFound++;
   logger.log("target_found", {
     game_id: g.game_id,
@@ -296,10 +304,25 @@ function onRawFound(det) {
   });
   track.everFound = true;
   startGameIfNeeded();
-  if (g.status === "completed") {
-    setArState("collected");
-    showCollectCard(false);
-  } else setArState("found");
+  playReveal();
+}
+
+/** 변신 연출 → 끝날 무렵 캐릭터 등장 + 안내 문구 전환 */
+function playReveal() {
+  setArState("transforming");
+  ar.playTransform(() => {
+    if (!character || !stage || !track.confirmed) return;
+    stage.visible = true;
+    character.spawn(t3);
+    const gg = state.game;
+    if (gg.status === "completed") {
+      setArState("collected");
+      showCollectCard(false);
+    } else {
+      if (PLACEMENT === "transform" && confetti) confetti.burst(t3);
+      setArState("found");
+    }
+  });
 }
 
 function startGameIfNeeded() {
@@ -337,7 +360,8 @@ function onTap(ev) {
   if (!ar || !ar.running) return;
   const x = ev.clientX;
   const y = ev.clientY;
-  const hit = character && ar.anchor.visible ? ar.hitTest(x, y, character.hitTargets) : null;
+  // three.js 레이캐스트는 visible 을 보지 않으므로, 변신 중(아직 안 보이는) 캐릭터는 직접 걸러낸다
+  const hit = character && ar.anchor.visible && stage && stage.visible ? ar.hitTest(x, y, character.hitTargets) : null;
   ring(x, y, !!hit);
   if (!hit) {
     track.misses++;
@@ -470,7 +494,7 @@ async function startAr() {
   if (currentScreen !== "ar") return;
   $("#ar-loading-text").textContent = "카메라 준비 중…";
 
-  ar = new ArSession($("#ar-stage"), { onFound: onRawFound, onLost: onRawLost, onFrame, safeBottom });
+  ar = new ArSession($("#ar-stage"), { onFound: onRawFound, onLost: onRawLost, onFrame, safeBottom }, { placement: PLACEMENT });
   ensureStage();
   try {
     await ar.start(detector);
@@ -494,6 +518,7 @@ async function startAr() {
     video_height: ar.video.videoHeight,
     detector_backend: detectorInfo.backend,
     detector_threads: detectorInfo.threads,
+    placement: PLACEMENT,
     elapsed_ms: Math.round(track.cameraReadyAt - track.startPressedAt),
   });
   $("#ar-loading").hidden = true;
@@ -573,7 +598,7 @@ function updateDebug() {
   lines.push(`screen=${currentScreen} state=${$("#screen-ar").dataset.state} model=${detectorInfo ? detectorInfo.backend + (detectorInfo.threads ? "x" + detectorInfo.threads : "") : Math.round(modelProgress * 100) + "%"} coi=${self.crossOriginIsolated}`);
   if (ar && ar.video) {
     lines.push(`video ${ar.video.videoWidth}x${ar.video.videoHeight} detect ${ar.stats.detectMs.toFixed(0)}ms ${ar.stats.detectFps}fps render ${ar.stats.renderFps.toFixed(0)}fps`);
-    lines.push(`raw found/lost ${ar.stats.rawFound}/${ar.stats.rawLost} · logged ${track.loggedFound}/${track.loggedLost} · miss taps ${track.misses}`);
+    lines.push(`raw found/lost ${ar.stats.rawFound}/${ar.stats.rawLost} · logged ${track.loggedFound}/${track.loggedLost} · miss taps ${track.misses} · ${PLACEMENT} fx ${ar.stats.transforms}/${ar.stats.reveals}`);
     lines.push("dets " + (ar.stats.lastDets.map((d) => `${d.name}:${d.score.toFixed(2)}`).join(" ") || "-"));
     const b = ar.bottleScreenBox;
     lines.push(b ? `bottle (${b.x1.toFixed(0)},${b.y1.toFixed(0)})-(${b.x2.toFixed(0)},${b.y2.toFixed(0)})` : "bottle: not tracked");
@@ -599,7 +624,14 @@ window.__cassmongo = {
   get tracking() { return !!(ar && ar.anchor.visible); },
   get confirmed() { return track.confirmed; },
   get characterId() { return character ? character.id : null; },
-  get characterVisible() { return !!(ar && ar.anchor.visible && character); },
+  get characterVisible() { return !!(ar && ar.anchor.visible && character && stage && stage.visible); },
+  placement: PLACEMENT,
+  /** 병 가림막이 화면 (x,y) 에 칠해졌는지 (alpha 0~255) */
+  coverAlpha(x, y) {
+    if (!ar || !ar.cover) return null;
+    const r = ar.cover.canvas.getBoundingClientRect();
+    return ar.cover.ctx.getImageData(Math.round(x - r.left), Math.round(y - r.top), 1, 1).data[3];
+  },
   cameraActive: () => !!(ar && ar.cameraActive),
   /** 추적 중인 병의 화면 박스 (컨테이너 기준 px) */
   bottleBox: () => (ar ? ar.bottleScreenBox : null),
@@ -607,7 +639,7 @@ window.__cassmongo = {
   anchorScreenPoint: () => (ar && ar.anchor.visible ? ar.projectObject(ar.anchor) : null),
   /** 캐릭터 몸통의 지금 화면 위치 (점프·회전 중이면 그 순간의 메시 위치) */
   characterScreenPoint() {
-    if (!ar || !ar.anchor.visible || !character) return null;
+    if (!ar || !ar.anchor.visible || !character || !stage || !stage.visible) return null;
     ar.scene.updateMatrixWorld(true);
     const c = new THREE.Box3().setFromObject(character.root).getCenter(new THREE.Vector3());
     const local = character.root.worldToLocal(c);

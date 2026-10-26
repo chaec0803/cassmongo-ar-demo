@@ -1,8 +1,12 @@
 // 카메라 + 카스 병 탐지 + three.js 렌더링.
-// 병 탐지는 화면 속 병의 위치·크기(박스)만 준다. 캐릭터는 그 병 옆 바닥선에 서도록 놓고,
-// 병이 움직이거나 가까워지면(커지면) 따라 움직이고 커진다. 병의 기울기·원근(3D 자세)은 알 수 없으므로 반영하지 않는다.
+// 병 탐지는 화면 속 병의 위치·크기(박스)만 준다. 병의 기울기·원근(3D 자세)은 알 수 없으므로 반영하지 않는다.
+// 배치 방식(placement):
+//  - "transform"(기본): 병이 빛나며 줄어들어 캐릭터로 변신. 실제 병 자리는 주변 배경으로 메워 가리고 그 자리에 캐릭터가 선다.
+//  - "side": 병 옆 바닥선에 캐릭터가 선다.
 import * as THREE from "../vendor/three/three.module.js";
 import { createTracker } from "./tracker.js";
+import { BottleCover } from "./bottle-cover.js";
+import { TransformFx, REVEAL_AT } from "./transform-fx.js";
 
 export class ArError extends Error {
   constructor(kind, cause) {
@@ -36,11 +40,17 @@ const CHAR_UNITS = 1.15; // characters.js 캐릭터 키(월드 단위)
 export class ArSession {
   /**
    * @param {HTMLElement} container
-   * @param {object} cb { onFound(det), onLost(), onFrame(t, dt), onDetect(dets) }
+   * @param {object} cb { onFound(det), onLost(), onFrame(t, dt), onDetect(dets), safeBottom() }
+   * @param {{placement?: "transform"|"side"}} opts
    */
-  constructor(container, cb = {}) {
+  constructor(container, cb = {}, opts = {}) {
     this.container = container;
     this.cb = cb;
+    this.placement = opts.placement === "side" ? "side" : "transform";
+    this.cover = null;
+    this._fx = null;
+    this._bgoal = null; // 병 화면 박스 목표
+    this._bcur = null; // 부드럽게 따라가는 병 화면 박스
     this.video = null;
     this.stream = null;
     this.renderer = null;
@@ -64,7 +74,7 @@ export class ArSession {
     this._raf = 0;
     this._lastT = 0;
     this._onResize = () => this.resize();
-    this.stats = { detectMs: 0, detectFps: 0, renderFps: 0, rawFound: 0, rawLost: 0, lastDets: [] };
+    this.stats = { detectMs: 0, detectFps: 0, renderFps: 0, rawFound: 0, rawLost: 0, lastDets: [], transforms: 0, reveals: 0 };
     this._detTimes = [];
   }
 
@@ -100,6 +110,7 @@ export class ArSession {
       });
       await video.play().catch(() => {});
 
+      if (this.placement === "transform") this.cover = new BottleCover(this.container); // 영상 위, 3D 아래
       this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
       this.renderer.outputColorSpace = THREE.SRGBColorSpace;
       this.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
@@ -145,15 +156,23 @@ export class ArSession {
       this.cb.onDetect && this.cb.onDetect(dets);
 
       const change = this.tracker.update(dets, now);
-      if (this.tracker.showing) this._setGoal(this.tracker.box);
+      if (this.tracker.showing) {
+        this._bgoal = this.videoBoxToScreen(this.tracker.box);
+        this._setGoal(this.tracker.box);
+        if (this.cover) this.cover.update(v, this.tracker.box);
+      }
       if (change === "found") {
         this.stats.rawFound++;
         this._cur = null; // 새로 잡히면 미끄러지지 않고 바로 그 자리에서 등장
+        this._bcur = null;
         this.anchor.visible = true;
+        if (this.cover) this.cover.visible = true;
         this.cb.onFound && this.cb.onFound(this.tracker.box);
       } else if (change === "lost") {
         this.stats.rawLost++;
         this.anchor.visible = false; // 병을 놓치면 즉시 숨긴다
+        if (this.cover) this.cover.visible = false;
+        this._endFx(false);
         this.cb.onLost && this.cb.onLost();
       }
       // 렌더링에 숨 돌릴 틈을 준다 (WASM 은 메인 스레드에서 돈다)
@@ -178,6 +197,7 @@ export class ArSession {
    * - 발은 하단 안내 카드보다 위에 둔다 (cb.safeBottom)
    */
   _setGoal(vbox) {
+    if (this.placement === "transform") return this._setGoalTransform(vbox);
     const MIN_SIDE = 80;
     const b = this.videoBoxToScreen(vbox);
     const W = this.container.clientWidth;
@@ -203,6 +223,69 @@ export class ArSession {
     this._goal = { x, y, s, side: this._side };
   }
 
+  /** 변신: 병이 있던 자리(가운데 바닥)에 병을 덮을 만큼 크게 세운다 */
+  _setGoalTransform(vbox) {
+    const b = this.videoBoxToScreen(vbox);
+    const H = this.container.clientHeight;
+    const W = this.container.clientWidth;
+    const bw = b.x2 - b.x1;
+    const bh = b.y2 - b.y1;
+    const s = Math.max(80, Math.min(H * 0.38, Math.max(bh * 0.55, bw * 1.15)));
+    const x = Math.min(W - s / 2, Math.max(s / 2, (b.x1 + b.x2) / 2));
+    const safeBottom = (this.cb.safeBottom && this.cb.safeBottom()) || H;
+    const y = Math.max(s + 8, Math.min(safeBottom - 8, b.y2 - bh * 0.02));
+    this._goal = { x, y, s, side: 0 };
+  }
+
+  /** 화면 px → 월드 (DEPTH 평면) */
+  _toWorld(sx, sy) {
+    const H = this.container.clientHeight;
+    const W = this.container.clientWidth;
+    const k = (2 * DEPTH * Math.tan(((FOV / 2) * Math.PI) / 180)) / H;
+    return { x: (sx - W / 2) * k, y: -(sy - H / 2) * k, k };
+  }
+
+  /**
+   * 변신 연출을 시작한다. 진행 중 REVEAL_AT 지점에서 onReveal() 을 부른다.
+   * side 모드이거나 병 박스가 없으면 바로 onReveal().
+   */
+  playTransform(onReveal) {
+    this._endFx(false);
+    if (this.placement !== "transform" || !this.tracker.showing || !this.video) {
+      onReveal && onReveal();
+      return;
+    }
+    const fx = new TransformFx(this.video, this.tracker.box);
+    this.scene.add(fx.group);
+    this._fx = { fx, onReveal };
+    this.stats.transforms++;
+  }
+
+  _endFx(reveal) {
+    if (!this._fx) return;
+    const { fx, onReveal } = this._fx;
+    this._fx = null;
+    if (reveal && !fx.revealed) {
+      fx.revealed = true;
+      onReveal && onReveal();
+    }
+    fx.dispose();
+  }
+
+  _updateFx() {
+    if (!this._fx || !this._bcur) return;
+    const b = this._bcur;
+    const bottom = this._toWorld((b.x1 + b.x2) / 2, b.y2);
+    const { fx, onReveal } = this._fx;
+    const p = fx.update({ x: bottom.x, y: bottom.y, z: -DEPTH - 0.05, w: (b.x2 - b.x1) * bottom.k, h: (b.y2 - b.y1) * bottom.k });
+    if (p >= REVEAL_AT && !fx.revealed) {
+      fx.revealed = true;
+      this.stats.reveals++;
+      onReveal && onReveal();
+    }
+    if (fx.done) this._endFx(false);
+  }
+
   _applyAnchor(dt) {
     if (!this._goal) return;
     if (!this._cur) this._cur = { ...this._goal };
@@ -225,7 +308,18 @@ export class ArSession {
     const dt = Math.min(0.1, (now - this._lastT) / 1000);
     this._lastT = now;
     this.stats.renderFps = this.stats.renderFps * 0.9 + (dt > 0 ? 1 / dt : 0) * 0.1;
-    if (this.anchor.visible) this._applyAnchor(dt);
+    if (this.anchor.visible) {
+      this._applyAnchor(dt);
+      if (this._bgoal) {
+        if (!this._bcur) this._bcur = { ...this._bgoal };
+        else {
+          const a = 1 - Math.exp(-dt * 14);
+          for (const k of ["x1", "y1", "x2", "y2"]) this._bcur[k] += (this._bgoal[k] - this._bcur[k]) * a;
+        }
+      }
+      this._updateFx();
+    }
+    if (this.cover) this.cover.draw(this.anchor.visible ? this._bcur : null);
     this.cb.onFrame && this.cb.onFrame(now / 1000, dt);
     this.renderer.render(this.scene, this.camera);
   }
@@ -255,6 +349,7 @@ export class ArSession {
     camera.aspect = cw / ch;
     camera.updateProjectionMatrix();
     renderer.setSize(cw, ch);
+    if (this.cover) this.cover.resize(cw, ch);
   }
 
   /** 화면 좌표(px) → 레이캐스트. 맞힌 첫 오브젝트 또는 null */
@@ -304,9 +399,14 @@ export class ArSession {
       this.renderer.dispose();
       this.renderer = null;
     }
+    this._endFx(false);
+    if (this.cover) {
+      this.cover.dispose();
+      this.cover = null;
+    }
     this.tracker.reset();
     this.anchor.visible = false;
-    this._goal = this._cur = null;
+    this._goal = this._cur = this._bgoal = this._bcur = null;
   }
 
   get cameraActive() {
