@@ -92,13 +92,10 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .ar-video { position: absolute; object-fit: fill; z-index: 0; }
 .ar-canvas { position: absolute; inset: 0; z-index: 1; width: 100% !important; height: 100% !important; }
 .ar-hud { position: absolute; inset: 0; z-index: 2; pointer-events: none; display: flex; flex-direction: column; }
-.ar-hud button, .ar-hud a, .ar-hud .tips, .ar-hud .exp-panel { pointer-events: auto; }
+.ar-hud button, .ar-hud a, .ar-hud .tips { pointer-events: auto; }
 .topbar.dark { color: #fff; }
 
-.exp-banner { margin: 4px 16px 0; padding: 10px 12px; border-radius: 12px; background: #ff9f1a; color: #2b1600; font-weight: 800; font-size: 14px; line-height: 1.4; }
-.exp-banner small { font-weight: 600; font-size: 12px; }
-
-.scan-guide { position: relative; margin: auto; width: min(72vw, 330px); aspect-ratio: 1; transition: opacity .25s ease; }
+.scan-guide { position: relative; margin: auto; width: min(46vw, 210px); aspect-ratio: 0.5; max-height: 52vh; transition: opacity .25s ease; }
 .scan-guide .c { position: absolute; width: 44px; height: 44px; border: 5px solid #fff; border-radius: 6px; filter: drop-shadow(0 0 6px rgba(0,0,0,.4)); }
 .scan-guide .tl { top: 0; left: 0; border-right: 0; border-bottom: 0; }
 .scan-guide .tr { top: 0; right: 0; border-left: 0; border-bottom: 0; }
@@ -128,15 +125,6 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .tips { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; font-size: 13px; line-height: 1.5; }
 .tips ul { margin: 6px 0 0; padding-left: 18px; }
 .tips a { color: var(--cass); font-weight: 700; }
-.exp-panel { margin-top: 10px; font-size: 13px; line-height: 1.5; }
-.exp-panel .row { display: flex; gap: 8px; margin-top: 8px; }
-.exp-panel .row > * { flex: 1; }
-.exp-panel table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-.exp-panel td { padding: 2px 0; }
-.exp-panel td:last-child { text-align: right; font-weight: 800; }
-.exp-capture { position: absolute; left: 50%; top: 46%; transform: translate(-50%, -50%); width: 58vw; height: 34vh; border: 3px dashed var(--yellow); border-radius: 10px; box-shadow: 0 0 0 9999px rgba(0,0,0,.35); pointer-events: none; }
-.progress { height: 8px; border-radius: 6px; background: #e1e8f5; overflow: hidden; margin-top: 8px; }
-.progress i { display: block; height: 100%; background: var(--cass); width: 0; transition: width .2s ease; }
 
 .tap-ring { position: absolute; z-index: 3; width: 56px; height: 56px; margin: -28px 0 0 -28px; border-radius: 50%; border: 3px solid rgba(255,255,255,.85); pointer-events: none; animation: ring .45s ease-out forwards; }
 .tap-ring.hit { border-color: var(--yellow); border-width: 5px; }

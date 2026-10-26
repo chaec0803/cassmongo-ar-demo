@@ -1,15 +1,14 @@
 // 카스몬고 AR 데모 — 화면 흐름·미션·기록을 묶는 진입점.
+// 카스 병을 비추면 병 옆에 카스몬(3D 캐릭터)이 나타난다.
 import * as THREE from "../vendor/three/three.module.js";
-import { ArSession, ArError } from "./ar.js";
+import { ArSession, ArError, hasWebGL } from "./ar.js";
+import { BottleDetector, DetectorError } from "./detector.js";
 import { CHARACTERS, createCharacter, createConfetti, createShadow, renderThumbnails } from "./characters.js";
 import { CHARACTER_IDS, TAPS_TO_COLLECT, createStore, ensureGame, markStarted, newId, nextGame, registerHit } from "./game.js";
 import { EVENT_NAMES, createLogger } from "./logger.js";
-import { startBottleExperiment } from "./bottle.js";
 
-const TARGET_URL = "targets/cassmongo-table.mind";
 const LOST_GRACE_MS = 700; // 이 시간 안에 다시 잡히면 '유실'로 보지 않는다 (깜박임으로 로그가 쌓이는 것 방지)
 const SCAN_TIPS_AFTER_MS = 15000;
-const STAGE_SCALE = 0.42; // 캐릭터 키 ≈ 타깃 폭의 46%
 
 const $ = (s) => document.querySelector(s);
 const params = new URLSearchParams(location.search);
@@ -179,13 +178,36 @@ function openModal(name) {
   document.querySelectorAll(".modal").forEach((m) => (m.hidden = m.id !== `modal-${name}`));
 }
 
+// ---------- 병 탐지기 (한 번만 내려받는다) ----------
+let detectorPromise = null;
+let detectorInfo = null;
+let modelProgress = 0;
+function getDetector() {
+  if (!detectorPromise) {
+    const d = new BottleDetector();
+    detectorPromise = d
+      .load((p) => {
+        modelProgress = p;
+        const el = $("#ar-loading-text");
+        if (el && currentScreen === "ar") el.textContent = `카스몬 탐지기 준비 중… ${Math.round(p * 100)}%`;
+      })
+      .then((info) => {
+        detectorInfo = info;
+        return d;
+      })
+      .catch((e) => {
+        detectorPromise = null; // 다시 시도할 수 있게
+        throw e;
+      });
+  }
+  return detectorPromise;
+}
+
 // ---------- AR 미션 ----------
 let ar = null;
 let stage = null; // 앵커 아래 Y-up 무대
 let character = null;
 let confetti = null;
-let arMode = "table"; // table | bottle_experiment
-let bottleExp = null;
 let t3 = 0; // three 애니메이션 시계(초)
 const track = {
   confirmed: false, // 디바운스 거친 '인식 중' 상태
@@ -208,20 +230,19 @@ function setArState(s) {
   const g = state.game;
   const ch = g ? CHARACTERS[g.character_id] : null;
   $("#scan-tips").hidden = true;
-  if (arMode === "bottle_experiment") return; // 실험 모드는 bottle.js 가 상태 문구를 그린다
   if (s === "scanning") {
-    badge.textContent = "인식 대기";
-    title.textContent = "테이블의 카스몬고 이미지를 비춰주세요";
-    sub.textContent = "카드 전체가 네모 안에 들어오게 맞춰 주세요.";
+    badge.textContent = "병 찾는 중";
+    title.textContent = "테이블 위 카스 병을 비춰주세요";
+    sub.textContent = "병 전체가 화면에 들어오게 비추면 카스몬이 나타나요.";
   } else if (s === "lost") {
     badge.textContent = "다시 찾는 중";
-    title.textContent = "이미지를 다시 비춰주세요";
-    sub.textContent = g && g.status === "active" ? `${ch.name} 미션 진행 ${g.taps}/${TAPS_TO_COLLECT} 은(는) 그대로 유지돼요.` : "카드를 비추면 캐릭터가 다시 나타나요.";
+    title.textContent = "카스 병을 다시 비춰주세요";
+    sub.textContent = g && g.status === "active" ? `${ch.name} 미션 진행 ${g.taps}/${TAPS_TO_COLLECT} 은(는) 그대로 유지돼요.` : "병을 비추면 캐릭터가 다시 나타나요.";
     $("#tap-dots").classList.toggle("keep", !!(g && g.status === "active"));
   } else if (s === "found") {
     badge.textContent = "캐릭터 발견";
     title.textContent = `${ch.name} 발견! 캐릭터를 3번 터치하세요`;
-    sub.textContent = g.taps ? `좋아요! ${TAPS_TO_COLLECT - g.taps}번 더 터치하면 획득해요.` : "카드 위의 캐릭터를 직접 눌러야 해요.";
+    sub.textContent = g.taps ? `좋아요! ${TAPS_TO_COLLECT - g.taps}번 더 터치하면 획득해요.` : "병 옆의 캐릭터를 직접 눌러야 해요.";
   }
   document.querySelectorAll("#tap-dots i").forEach((d, i) => d.classList.toggle("on", !!g && i < g.taps));
 }
@@ -237,17 +258,15 @@ function buildStageFor(characterId) {
 }
 
 function ensureStage() {
+  // 앵커(ar.js)가 병 옆 바닥선 위치·크기를 잡아 주므로 무대는 그대로 둔다
   stage = new THREE.Group();
-  stage.rotation.x = Math.PI / 2; // 무대 Y-up → 타깃 평면의 법선(+Z) 방향으로 세운다
-  stage.scale.setScalar(STAGE_SCALE);
-  stage.position.set(0, 0.02, 0);
   stage.add(createShadow());
   confetti = createConfetti();
   stage.add(confetti.group);
   ar.anchor.add(stage);
 }
 
-function onRawFound() {
+function onRawFound(det) {
   if (track.lostTimer) {
     // 유실 유예 시간 안에 다시 잡힘 → 연속 추적으로 본다(로그 없음)
     clearTimeout(track.lostTimer);
@@ -257,7 +276,6 @@ function onRawFound() {
   if (track.confirmed) return;
   track.confirmed = true;
   track.foundAt = performance.now();
-  if (arMode === "bottle_experiment") return bottleExp && bottleExp.onFound();
 
   // 첫 인식 때 미션이 없으면 만든다 (캐릭터는 이때 무작위로 확정, 이후 재인식으로 바뀌지 않음)
   const r = ensureGame(state, ctx);
@@ -270,6 +288,8 @@ function onRawFound() {
   logger.log("target_found", {
     game_id: g.game_id,
     character_id: g.character_id,
+    detected_class: det ? det.name : null,
+    confidence: det ? +det.score.toFixed(3) : null,
     elapsed_ms: Math.round(performance.now() - track.cameraReadyAt),
     lost_ms: track.everFound ? Math.round(performance.now() - track.lostAt) : null,
     occurrence: track.loggedFound,
@@ -301,7 +321,6 @@ function onRawLost() {
     track.confirmed = false;
     track.lostAt = performance.now();
     track.scanSince = performance.now();
-    if (arMode === "bottle_experiment") return bottleExp && bottleExp.onLost();
     track.loggedLost++;
     const g = state.game;
     logger.log("target_lost", {
@@ -315,7 +334,7 @@ function onRawLost() {
 }
 
 function onTap(ev) {
-  if (!ar || !ar.running || arMode !== "table") return;
+  if (!ar || !ar.running) return;
   const x = ev.clientX;
   const y = ev.clientY;
   const hit = character && ar.anchor.visible ? ar.hitTest(x, y, character.hitTargets) : null;
@@ -405,42 +424,61 @@ function onNextExplore() {
   }
 }
 
+/** 캐릭터 발이 가려지지 않도록 하단 안내 카드(또는 획득 카드) 윗선을 돌려준다 */
+function safeBottom() {
+  const card = $("#collect-card");
+  const el = !card.hidden ? card : $("#status");
+  const top = el.getBoundingClientRect().top;
+  return top > 0 ? top - $("#ar-stage").getBoundingClientRect().top : null;
+}
+
 function onFrame(t, dt) {
   t3 += dt;
   if (character) character.update(t3);
   if (confetti) confetti.update(t3);
-  if (arMode === "table" && !track.confirmed && currentScreen === "ar" && track.scanSince &&
+  if (!track.confirmed && currentScreen === "ar" && track.scanSince &&
       performance.now() - track.scanSince > SCAN_TIPS_AFTER_MS && $("#scan-tips").hidden &&
       $("#screen-ar").dataset.state !== "loading") {
     $("#scan-tips").hidden = false;
   }
-  bottleExp && bottleExp.onFrame();
   if (debugOn) updateDebug();
 }
 
-async function startAr(mode = "table") {
-  arMode = mode;
+async function startAr() {
   go("ar");
   $("#ar-place").textContent = placeLabel();
-  $("#exp-banner").hidden = mode !== "bottle_experiment";
-  $("#exp-panel").hidden = mode !== "bottle_experiment";
   $("#collect-card").hidden = true;
   $("#resume").hidden = true;
   $("#ar-loading").hidden = false;
-  $("#ar-loading-text").textContent = "카메라 준비 중…";
+  $("#ar-loading-text").textContent = detectorInfo ? "카메라 준비 중…" : `카스몬 탐지기 준비 중… ${Math.round(modelProgress * 100)}%`;
   $("#screen-ar").dataset.state = "loading";
   Object.assign(track, { confirmed: false, lostTimer: 0, everFound: false, scanSince: 0 });
   track.startPressedAt = performance.now();
 
-  ar = new ArSession($("#ar-stage"), { onFound: onRawFound, onLost: onRawLost, onFrame });
+  // 모델(약 27MB)을 받기 전에, 어차피 안 되는 환경은 바로 안내한다
+  if (!window.isSecureContext) return showError(new ArError("insecure"));
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return showError(new ArError("unsupported"));
+  if (!hasWebGL()) return showError(new ArError("webgl"));
+
+  let detector;
+  try {
+    detector = await getDetector();
+  } catch (e) {
+    showError(new ArError(e instanceof DetectorError ? e.kind : "runtime", e.cause || e));
+    return;
+  }
+  if (currentScreen !== "ar") return;
+  $("#ar-loading-text").textContent = "카메라 준비 중…";
+
+  ar = new ArSession($("#ar-stage"), { onFound: onRawFound, onLost: onRawLost, onFrame, safeBottom });
   ensureStage();
   try {
-    await ar.start(mode === "table" ? TARGET_URL : null);
+    await ar.start(detector);
   } catch (e) {
     const err = e instanceof ArError ? e : new ArError("unknown", e);
     ar.stop();
     ar = null;
-    showError(err, mode);
+    showError(err);
     return;
   }
   if (currentScreen !== "ar") {
@@ -452,29 +490,22 @@ async function startAr(mode = "table") {
   track.scanSince = performance.now();
   logger.log("camera_ready", {
     game_id: state.game ? state.game.game_id : null,
-    mode: arMode,
     video_width: ar.video.videoWidth,
     video_height: ar.video.videoHeight,
+    detector_backend: detectorInfo.backend,
+    detector_threads: detectorInfo.threads,
     elapsed_ms: Math.round(track.cameraReadyAt - track.startPressedAt),
   });
   $("#ar-loading").hidden = true;
-  if (mode === "table") {
-    // 이전 미션이 있으면 같은 캐릭터를 미리 올려 둔다 (보이는 건 인식 후)
-    if (state.game) buildStageFor(state.game.character_id);
-    setArState("scanning");
-  } else {
-    if (character) { stage.remove(character.root); character.dispose(); }
-    character = createCharacter("cool");
-    stage.add(character.root);
-    bottleExp = startBottleExperiment({ ar, logger, ctx, track, onExit: () => go("intro"), toast });
-  }
+  // 이전 미션이 있으면 같은 캐릭터를 미리 올려 둔다 (보이는 건 병을 찾은 뒤)
+  if (state.game) buildStageFor(state.game.character_id);
+  setArState("scanning");
 }
 
 function stopAr() {
   if (track.lostTimer) clearTimeout(track.lostTimer);
   track.lostTimer = 0;
   track.confirmed = false;
-  if (bottleExp) { bottleExp.dispose(); bottleExp = null; }
   if (ar) ar.stop();
   ar = null;
   if (character) { character.dispose(); character = null; }
@@ -484,14 +515,11 @@ function stopAr() {
 // ---------- 오류 ----------
 const inApp = /KAKAOTALK|Instagram|FBAN|FBAV|NAVER\(inapp|Line\/|DaumApps|everytimeApp/i.test(navigator.userAgent);
 const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-let lastErrorMode = "table";
-
-function showError(err, mode) {
-  lastErrorMode = mode;
+function showError(err) {
   const E = {
     denied: {
       t: "카메라 권한이 거부됐어요",
-      d: "카메라를 허용해야 테이블 카드를 찾을 수 있어요.",
+      d: "카메라를 허용해야 카스 병을 찾을 수 있어요.",
       s: isIOS
         ? ["주소창의 ‘가가(aA)’ 또는 설정 > Safari > 카메라 에서 ‘허용’으로 바꿔 주세요.", "아래 ‘다시 시도’를 눌러 주세요. 계속 안 되면 페이지를 새로고침해 주세요."]
         : ["주소창 왼쪽 아이콘(자물쇠·설정)을 눌러 권한 > 카메라를 ‘허용’으로 바꿔 주세요.", "아래 ‘다시 시도’를 눌러 주세요. 계속 안 되면 페이지를 새로고침해 주세요."],
@@ -517,7 +545,8 @@ function showError(err, mode) {
       s: ["카메라·영상통화 앱을 종료해 주세요.", "이 페이지의 다른 탭이 열려 있다면 닫아 주세요.", "아래 ‘다시 시도’를 눌러 주세요."],
     },
     webgl: { t: "3D 화면을 그릴 수 없어요", d: "이 브라우저는 WebGL(3D 그래픽)을 지원하지 않거나 꺼져 있어요.", s: ["최신 Safari 또는 Chrome 으로 열어 주세요.", "절전 모드를 끄고 다시 시도해 주세요."], copy: true },
-    target_load: { t: "인식 데이터를 불러오지 못했어요", d: "네트워크가 불안정해 카드 인식 데이터를 받지 못했어요.", s: ["와이파이·데이터 연결을 확인해 주세요.", "아래 ‘다시 시도’를 눌러 주세요."] },
+    model_load: { t: "인식 데이터를 불러오지 못했어요", d: "네트워크가 불안정해 병 인식 데이터(약 27MB)를 받지 못했어요.", s: ["와이파이·데이터 연결을 확인해 주세요.", "아래 ‘다시 시도’를 눌러 주세요."] },
+    runtime: { t: "병 인식 기능을 시작하지 못했어요", d: "이 기기·브라우저에서 인식 엔진이 동작하지 않았어요.", s: ["최신 Safari(iPhone) 또는 Chrome(Android)으로 열어 주세요.", "다른 앱을 닫고 다시 시도해 주세요."], copy: true },
     unknown: { t: "카메라를 시작하지 못했어요", d: "알 수 없는 오류가 발생했어요.", s: ["페이지를 새로고침한 뒤 다시 시도해 주세요.", "계속되면 Safari(iPhone) 또는 Chrome(Android)으로 열어 주세요."] },
   }[err.kind] || {};
   $("#err-title").textContent = E.t;
@@ -541,15 +570,13 @@ function updateDebug() {
   if (now - (updateDebug._t || 0) < 200) return;
   updateDebug._t = now;
   const lines = [];
-  lines.push(`mode=${arMode} screen=${currentScreen} state=${$("#screen-ar").dataset.state}`);
+  lines.push(`screen=${currentScreen} state=${$("#screen-ar").dataset.state} model=${detectorInfo ? detectorInfo.backend + (detectorInfo.threads ? "x" + detectorInfo.threads : "") : Math.round(modelProgress * 100) + "%"} coi=${self.crossOriginIsolated}`);
   if (ar && ar.video) {
-    lines.push(`video ${ar.video.videoWidth}x${ar.video.videoHeight} proc ${ar.stats.processFps}fps render ${ar.stats.renderFps.toFixed(0)}fps`);
+    lines.push(`video ${ar.video.videoWidth}x${ar.video.videoHeight} detect ${ar.stats.detectMs.toFixed(0)}ms ${ar.stats.detectFps}fps render ${ar.stats.renderFps.toFixed(0)}fps`);
     lines.push(`raw found/lost ${ar.stats.rawFound}/${ar.stats.rawLost} · logged ${track.loggedFound}/${track.loggedLost} · miss taps ${track.misses}`);
-    if (ar.anchor.visible) {
-      const c = ar.project([0, 0, 0]);
-      const r = ar.project([0.5, 0, 0]);
-      lines.push(`target center (${c.x.toFixed(0)},${c.y.toFixed(0)}) halfW ${Math.hypot(r.x - c.x, r.y - c.y).toFixed(0)}px`);
-    } else lines.push("target: not tracked");
+    lines.push("dets " + (ar.stats.lastDets.map((d) => `${d.name}:${d.score.toFixed(2)}`).join(" ") || "-"));
+    const b = ar.bottleScreenBox;
+    lines.push(b ? `bottle (${b.x1.toFixed(0)},${b.y1.toFixed(0)})-(${b.x2.toFixed(0)},${b.y2.toFixed(0)})` : "bottle: not tracked");
   }
   const g = state.game;
   lines.push(g ? `game ${g.game_id.slice(-8)} ${g.character_id} ${g.status} taps ${g.taps}` : "game: none");
@@ -574,15 +601,19 @@ window.__cassmongo = {
   get characterId() { return character ? character.id : null; },
   get characterVisible() { return !!(ar && ar.anchor.visible && character); },
   cameraActive: () => !!(ar && ar.cameraActive),
-  project: (p) => (ar && ar.anchor.visible ? ar.project(p) : null),
-  /** 캐릭터 몸통(무대 좌표 y=0.5) 의 화면 위치 */
+  /** 추적 중인 병의 화면 박스 (컨테이너 기준 px) */
+  bottleBox: () => (ar ? ar.bottleScreenBox : null),
+  /** 캐릭터 발(앵커 원점)의 화면 위치 */
+  anchorScreenPoint: () => (ar && ar.anchor.visible ? ar.projectObject(ar.anchor) : null),
+  /** 캐릭터 몸통의 지금 화면 위치 (점프·회전 중이면 그 순간의 메시 위치) */
   characterScreenPoint() {
     if (!ar || !ar.anchor.visible || !character) return null;
     ar.scene.updateMatrixWorld(true);
-    const v = new THREE.Vector3(0, 0.5, 0).applyMatrix4(character.root.matrixWorld).project(ar.camera);
-    const rect = ar.renderer.domElement.getBoundingClientRect();
-    return { x: rect.left + ((v.x + 1) / 2) * rect.width, y: rect.top + ((1 - v.y) / 2) * rect.height };
+    const c = new THREE.Box3().setFromObject(character.root).getCenter(new THREE.Vector3());
+    const local = character.root.worldToLocal(c);
+    return ar.projectObject(character.root, [local.x, local.y, local.z]);
   },
+  detector: () => detectorInfo,
   logs: () => logger.all(),
   stats: () => (ar ? { ...ar.stats } : null),
 };
@@ -590,15 +621,14 @@ window.__cassmongo = {
 // ---------- 바인딩 ----------
 function bind() {
   $("#adult-check").addEventListener("change", (e) => ($("#btn-start").disabled = !e.target.checked));
-  $("#btn-start").addEventListener("click", () => go("permission"));
-  $("#btn-camera").addEventListener("click", () => startAr("table"));
-  $("#btn-bottle").addEventListener("click", () => {
-    if (!$("#adult-check").checked) return toast("먼저 ‘만 19세 이상입니다’를 확인해 주세요.");
-    startAr("bottle_experiment");
+  $("#btn-start").addEventListener("click", () => {
+    if (window.isSecureContext && navigator.mediaDevices) getDetector().catch(() => {}); // 안내 화면을 읽는 동안 인식 모델을 미리 받는다
+    go("permission");
   });
+  $("#btn-camera").addEventListener("click", () => startAr());
   $("#btn-close").addEventListener("click", () => go("intro"));
   $("#btn-next").addEventListener("click", onNextExplore);
-  $("#btn-retry").addEventListener("click", () => startAr(lastErrorMode));
+  $("#btn-retry").addEventListener("click", () => startAr());
   $("#btn-copy-url").addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText(location.href);
@@ -607,7 +637,7 @@ function bind() {
       prompt("이 주소를 복사해 브라우저에 붙여 넣어 주세요.", location.href);
     }
   });
-  $("#btn-resume").addEventListener("click", () => startAr(arMode));
+  $("#btn-resume").addEventListener("click", () => startAr());
   $("#btn-resume-exit").addEventListener("click", () => go("intro"));
   document.querySelectorAll("[data-go]").forEach((b) => b.addEventListener("click", () => go(b.dataset.go)));
   document.querySelectorAll("[data-open]").forEach((b) => b.addEventListener("click", () => openModal(b.dataset.open)));
@@ -644,9 +674,7 @@ function bind() {
   window.addEventListener("pagehide", () => stopAr());
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden" && currentScreen === "ar" && ar) {
-      const mode = arMode;
       stopAr();
-      arMode = mode;
       $("#resume").hidden = false;
     }
   });

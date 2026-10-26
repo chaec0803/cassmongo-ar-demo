@@ -7,6 +7,24 @@
   <meta name="robots" content="noindex">
   <title>카스몬고 AR 체험</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <!-- GitHub Pages 는 응답 헤더를 못 바꾸므로, 서비스워커로 교차 출처 격리(COOP/COEP)를 켜서 멀티스레드 인식을 쓴다.
+       모든 리소스가 같은 출처라 require-corp 로 통일한다(Safari 는 credentialless 미지원). 첫 방문 때 한 번 새로고침된다. -->
+  <script>
+    // 새로고침은 세션당 1번만: 서비스워커가 페이지를 못 잡는 환경(강력 새로고침·차단)에서 무한 새로고침을 막는다.
+    // 격리가 안 되면 인식은 단일 스레드로 계속 동작한다.
+    window.coi = {
+      coepCredentialless: () => false,
+      quiet: true,
+      doReload: () => {
+        try {
+          if (sessionStorage.getItem("cassmongo.coiReloaded")) return;
+          sessionStorage.setItem("cassmongo.coiReloaded", "1");
+        } catch (e) { return; }
+        window.location.reload();
+      },
+    };
+  </script>
+  <script src="coi-serviceworker.js"></script>
   <link rel="stylesheet" href="css/app.css">
   <script type="module" src="js/app.js"></script>
 </head>
@@ -22,9 +40,9 @@
     <div class="intro-hero">
       <div class="hero-thumbs" id="hero-thumbs"></div>
       <h1>카스몬고<br>AR 체험</h1>
-      <p class="lead">테이블 위 카스몬고 카드를 카메라로 비추면<br>숨어 있던 캐릭터가 나타나요.</p>
+      <p class="lead">테이블 위 카스 병을 카메라로 비추면<br>병 옆에 숨어 있던 카스몬이 나타나요.</p>
       <ol class="steps">
-        <li><b>1</b>카드 비추기</li>
+        <li><b>1</b>카스 병 비추기</li>
         <li><b>2</b>캐릭터 3번 터치</li>
         <li><b>3</b>도감에 수집</li>
       </ol>
@@ -41,11 +59,7 @@
       <p class="fineprint">데모용 <b>자기 확인</b>입니다. 실제 본인·연령 인증을 하지 않아요.</p>
       <button class="btn primary" id="btn-start" disabled>체험 시작</button>
       <div class="intro-links">
-        <button class="link" id="btn-bottle">실험: 카스 병 라벨 인식</button>
-        <span>·</span>
         <button class="link" data-open="log">참여 기록</button>
-        <span>·</span>
-        <a class="link" href="targets/cassmongo-table-target-A4.pdf" target="_blank" rel="noopener">타깃 카드 인쇄</a>
       </div>
       <p class="version" id="version">DEMO v1 · 실제 이벤트·주문과 연동되지 않음</p>
     </div>
@@ -59,8 +73,9 @@
       </div>
       <h2>카메라를 사용할게요</h2>
       <ul class="perm-list">
-        <li>테이블 위 <b>카스몬고 카드</b>를 찾는 데만 써요.</li>
-        <li>카메라 영상은 이 휴대폰 안에서만 처리돼요. <b>서버로 보내거나 저장하지 않아요.</b></li>
+        <li>테이블 위 <b>카스 병</b>을 찾는 데만 써요.</li>
+        <li>병 인식은 이 휴대폰 안에서 처리돼요. <b>카메라 영상을 서버로 보내거나 저장하지 않아요.</b></li>
+        <li>처음 한 번 인식 데이터(약 27MB)를 내려받아요. 와이파이를 권장해요.</li>
         <li>체험을 닫거나 다른 앱으로 나가면 카메라가 바로 꺼져요.</li>
       </ul>
       <p class="perm-hint">다음 화면에서 카메라 접근을 <b>‘허용’</b>해 주세요.</p>
@@ -83,10 +98,6 @@
         <button class="pill glass" data-open="dex">도감 <b class="dex-count">0/3</b></button>
       </header>
 
-      <div class="exp-banner" id="exp-banner" hidden>
-        실험 모드 · 카스 병 라벨 추적 시험<br><small>지정 이미지 인식과 별개 결과이며, 수집·기록 미션이 없습니다.</small>
-      </div>
-
       <div class="scan-guide" id="scan-guide" aria-hidden="true">
         <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
         <div class="scan-line"></div>
@@ -100,13 +111,12 @@
         <div class="tips" id="scan-tips" hidden>
           <b>인식이 잘 안 되나요?</b>
           <ul>
-            <li>카드 <b>전체</b>가 화면에 들어오게 20~50cm 떨어져 비춰 주세요.</li>
-            <li>조명이 반사되면 각도를 살짝 바꿔 주세요.</li>
-            <li>어두우면 밝은 곳으로 옮겨 주세요.</li>
-            <li>테이블의 카스몬고 카드가 없다면 직원에게 요청하거나 <a href="targets/cassmongo-table-target.png" target="_blank" rel="noopener">카드 이미지</a>를 다른 화면에 띄워 비춰 보세요.</li>
+            <li>병 <b>전체</b>(뚜껑~바닥)가 화면에 들어오게 30~60cm 떨어져 비춰 주세요.</li>
+            <li>폰을 세워서 병을 옆에서 보듯 비춰 주세요. 위에서 내려다보면 잘 안 돼요.</li>
+            <li>라벨이 보이게 병을 돌려 주세요. 어두우면 밝은 곳으로 옮겨 주세요.</li>
+            <li>카스 계열 병(카스 프레시·제로·레몬)만 인식해요.</li>
           </ul>
         </div>
-        <div class="exp-panel" id="exp-panel" hidden></div>
       </div>
     </div>
 

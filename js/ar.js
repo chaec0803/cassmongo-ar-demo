@@ -1,15 +1,13 @@
-// 카메라 + MindAR 이미지 추적 + three.js 렌더링.
-// MindAR 의 MindARThree 래퍼 대신 Controller 를 직접 쓴다:
-//  - 카메라 오류 종류(권한 거부/미지원/점유)를 구분해 안내하기 위해
-//  - 종료 시 카메라 트랙을 확실히 stop() 하기 위해
-//  - 래퍼가 쓰는 three 구버전 API(sRGBEncoding) 의존을 피하기 위해
+// 카메라 + 카스 병 탐지 + three.js 렌더링.
+// 병 탐지는 화면 속 병의 위치·크기(박스)만 준다. 캐릭터는 그 병 옆 바닥선에 서도록 놓고,
+// 병이 움직이거나 가까워지면(커지면) 따라 움직이고 커진다. 병의 기울기·원근(3D 자세)은 알 수 없으므로 반영하지 않는다.
 import * as THREE from "../vendor/three/three.module.js";
-import { Controller } from "../vendor/mindar/mindar-image.prod.js";
+import { createTracker } from "./tracker.js";
 
 export class ArError extends Error {
   constructor(kind, cause) {
     super(kind);
-    this.kind = kind; // insecure | unsupported | denied | no_camera | camera_busy | webgl | target_load | unknown
+    this.kind = kind; // insecure | unsupported | denied | no_camera | camera_busy | webgl | model_load | runtime | unknown
     this.cause = cause;
   }
 }
@@ -31,27 +29,28 @@ function classifyMediaError(err) {
   return "unknown";
 }
 
+const DEPTH = 4; // 캐릭터를 놓는 카메라 앞 거리(월드 단위). 화면 px ↔ 월드 환산에만 쓴다
+const FOV = 50;
+const CHAR_UNITS = 1.15; // characters.js 캐릭터 키(월드 단위)
+
 export class ArSession {
   /**
-   * @param {HTMLElement} container 전체 화면 컨테이너
-   * @param {object} cb { onFound(), onLost(), onFrame(t, dt), onProcess() }
+   * @param {HTMLElement} container
+   * @param {object} cb { onFound(det), onLost(), onFrame(t, dt), onDetect(dets) }
    */
   constructor(container, cb = {}) {
     this.container = container;
     this.cb = cb;
     this.video = null;
     this.stream = null;
-    this.controller = null;
     this.renderer = null;
+    this.detector = null;
     this.running = false;
-    this.anchorVisible = false;
-    this.targetBuffer = null;
-    this.markerDims = null;
+    this.tracker = createTracker();
 
     this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera();
-    this.anchor = new THREE.Group();
-    this.anchor.matrixAutoUpdate = false;
+    this.camera = new THREE.PerspectiveCamera(FOV, 1, 0.1, 100);
+    this.anchor = new THREE.Group(); // 캐릭터가 서는 자리
     this.anchor.visible = false;
     this.scene.add(this.anchor);
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0x223355, 2.0));
@@ -59,43 +58,26 @@ export class ArSession {
     dl.position.set(0.5, 1, 1);
     this.scene.add(dl);
 
-    this.postMatrix = new THREE.Matrix4();
+    this._goal = null; // {x, y, s, side} 목표 배치 (화면 px)
+    this._cur = null;
+    this._side = 1;
     this._raf = 0;
     this._lastT = 0;
     this._onResize = () => this.resize();
-    this.stats = { processFps: 0, renderFps: 0, rawFound: 0, rawLost: 0 };
-    this._procTimes = [];
+    this.stats = { detectMs: 0, detectFps: 0, renderFps: 0, rawFound: 0, rawLost: 0, lastDets: [] };
+    this._detTimes = [];
   }
 
-  /** target: URL 문자열 또는 ArrayBuffer(.mind) */
-  async start(target) {
+  /** detector: 이미 load() 된 BottleDetector */
+  async start(detector) {
     if (this.running) return;
+    this.detector = detector;
     if (!window.isSecureContext) throw new ArError("insecure");
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new ArError("unsupported");
     if (!hasWebGL()) throw new ArError("webgl");
 
-    // 1) 추적 데이터 먼저 (카메라를 켠 뒤 네트워크 오류가 나면 카메라만 켜진 채 남는 것을 피한다)
-    if (!this.targetBuffer && target) {
-      if (typeof target === "string") {
-        let res;
-        try {
-          res = await fetch(target);
-        } catch (e) {
-          throw new ArError("target_load", e);
-        }
-        if (!res.ok) throw new ArError("target_load", new Error(`HTTP ${res.status}`));
-        this.targetBuffer = await res.arrayBuffer();
-      } else {
-        this.targetBuffer = target;
-      }
-    }
-
-    // 2) 후면 카메라
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: { facingMode: { ideal: "environment" } },
-      });
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: "environment" } } });
     } catch (e) {
       throw new ArError(classifyMediaError(e), e);
     }
@@ -124,78 +106,117 @@ export class ArSession {
       this.renderer.domElement.className = "ar-canvas";
       this.container.appendChild(this.renderer.domElement);
 
-      if (this.targetBuffer) await this._buildController();
-      else this.resize();
       this.running = true;
+      this.resize();
       window.addEventListener("resize", this._onResize);
       this._ro = new ResizeObserver(this._onResize);
       this._ro.observe(this.container);
       this._lastT = performance.now();
       this._loop();
+      this._detectLoop();
     } catch (e) {
       this.stop();
       throw e instanceof ArError ? e : new ArError("unknown", e);
     }
   }
 
-  async _buildController() {
-    const video = this.video;
-    // MindAR 의 입력 로더는 video.width/height 속성을 프레임 크기로 읽는다 (0 이면 빈 프레임을 처리한다)
-    video.width = video.videoWidth;
-    video.height = video.videoHeight;
-    const controller = new Controller({
-      inputWidth: video.videoWidth,
-      inputHeight: video.videoHeight,
-      maxTrack: 1,
-      // 기본값(5/5)보다 약간 보수적으로: 순간 오검출로 캐릭터가 튀어나오지 않게
-      warmupTolerance: 6,
-      missTolerance: 6,
-      onUpdate: (data) => this._onUpdate(data),
-    });
-    this.controller = controller;
-    const { dimensions } = controller.addImageTargetsFromBuffer(this.targetBuffer.slice(0));
-    const [w, h] = dimensions[0];
-    this.markerDims = [w, h];
-    // MindAR 좌표(px, 좌하단 원점) → 타깃 중심 원점, 타깃 폭 = 1 단위
-    this.postMatrix.compose(
-      new THREE.Vector3(w / 2, w / 2 + (h - w) / 2, 0),
-      new THREE.Quaternion(),
-      new THREE.Vector3(w, w, w),
-    );
-    this.resize();
-    controller.dummyRun(video);
-    controller.processVideo(video);
+  async _detectLoop() {
+    while (this.running) {
+      const v = this.video;
+      if (!v || v.readyState < 2) {
+        await new Promise((r) => setTimeout(r, 50));
+        continue;
+      }
+      let dets = [];
+      try {
+        dets = await this.detector.detect(v);
+      } catch (e) {
+        console.error("[detect]", e && e.message ? e.message : e);
+        await new Promise((r) => setTimeout(r, 200));
+        continue;
+      }
+      if (!this.running) break;
+      const now = performance.now();
+      this._detTimes.push(now);
+      while (this._detTimes.length && now - this._detTimes[0] > 1000) this._detTimes.shift();
+      this.stats.detectFps = this._detTimes.length;
+      this.stats.detectMs = this.detector.lastMs;
+      this.stats.lastDets = dets;
+      this.cb.onDetect && this.cb.onDetect(dets);
+
+      const change = this.tracker.update(dets, now);
+      if (this.tracker.showing) this._setGoal(this.tracker.box);
+      if (change === "found") {
+        this.stats.rawFound++;
+        this._cur = null; // 새로 잡히면 미끄러지지 않고 바로 그 자리에서 등장
+        this.anchor.visible = true;
+        this.cb.onFound && this.cb.onFound(this.tracker.box);
+      } else if (change === "lost") {
+        this.stats.rawLost++;
+        this.anchor.visible = false; // 병을 놓치면 즉시 숨긴다
+        this.cb.onLost && this.cb.onLost();
+      }
+      // 렌더링에 숨 돌릴 틈을 준다 (WASM 은 메인 스레드에서 돈다)
+      await new Promise((r) => requestAnimationFrame(() => r()));
+    }
   }
 
-  _onUpdate(data) {
-    if (data.type === "processDone") {
-      const now = performance.now();
-      this._procTimes.push(now);
-      while (this._procTimes.length && now - this._procTimes[0] > 1000) this._procTimes.shift();
-      this.stats.processFps = this._procTimes.length;
-      this.cb.onProcess && this.cb.onProcess();
-      return;
+  /** 비디오 좌표 박스 → 화면(CSS px, 컨테이너 기준) 박스 */
+  videoBoxToScreen(b) {
+    const v = this.video;
+    const vr = v.getBoundingClientRect();
+    const cr = this.container.getBoundingClientRect();
+    const k = vr.width / v.videoWidth;
+    return { x1: vr.left - cr.left + b.x1 * k, y1: vr.top - cr.top + b.y1 * k, x2: vr.left - cr.left + b.x2 * k, y2: vr.top - cr.top + b.y2 * k };
+  }
+
+  /**
+   * 병 옆 바닥선에 캐릭터 자리를 잡는다.
+   * - 키는 병 높이의 45% (화면 높이 28% 상한)
+   * - 병 오른쪽/왼쪽 중 지금 쪽 → 반대쪽 순으로, 옆 공간에 맞게 줄여서(최소 MIN_SIDE px) 세운다
+   * - 양옆 다 좁으면(병이 화면 가운데를 꽉 채움) 병 가장자리에 반쯤 겹쳐 세운다
+   * - 발은 하단 안내 카드보다 위에 둔다 (cb.safeBottom)
+   */
+  _setGoal(vbox) {
+    const MIN_SIDE = 80;
+    const b = this.videoBoxToScreen(vbox);
+    const W = this.container.clientWidth;
+    const H = this.container.clientHeight;
+    const bh = b.y2 - b.y1;
+    const want = Math.max(MIN_SIDE, Math.min(H * 0.28, bh * 0.45));
+    const gap = Math.max(4, bh * 0.02);
+    const space = { 1: W - 4 - (b.x2 + gap), "-1": b.x1 - gap - 4 }; // 캐릭터 폭 ≈ 키
+    // 좌우가 프레임마다 뒤집히지 않게: 지금 쪽에 최소 크기라도 들어가면 유지
+    if (space[this._side] < MIN_SIDE && space[-this._side] >= MIN_SIDE) this._side = -this._side;
+    let x;
+    let s;
+    if (space[this._side] >= MIN_SIDE) {
+      s = Math.min(want, space[this._side]);
+      x = this._side === 1 ? b.x2 + gap + s / 2 : b.x1 - gap - s / 2;
+    } else {
+      s = want;
+      const edge = this._side === 1 ? b.x2 : b.x1;
+      x = Math.min(W - s / 2 - 4, Math.max(s / 2 + 4, edge));
     }
-    if (data.type !== "updateMatrix") return;
-    const { worldMatrix } = data;
-    if (worldMatrix) {
-      const m = new THREE.Matrix4();
-      m.elements = [...worldMatrix];
-      m.multiply(this.postMatrix);
-      this.anchor.matrix.copy(m);
-      this.anchor.matrixWorldNeedsUpdate = true;
-      if (!this.anchorVisible) {
-        this.anchorVisible = true;
-        this.anchor.visible = true;
-        this.stats.rawFound++;
-        this.cb.onFound && this.cb.onFound();
-      }
-    } else if (this.anchorVisible) {
-      this.anchorVisible = false;
-      this.anchor.visible = false; // 추적을 잃으면 즉시 숨긴다
-      this.stats.rawLost++;
-      this.cb.onLost && this.cb.onLost();
+    const safeBottom = (this.cb.safeBottom && this.cb.safeBottom()) || H;
+    const y = Math.max(s + 8, Math.min(safeBottom - 8, b.y2 - bh * 0.02));
+    this._goal = { x, y, s, side: this._side };
+  }
+
+  _applyAnchor(dt) {
+    if (!this._goal) return;
+    if (!this._cur) this._cur = { ...this._goal };
+    else {
+      const a = 1 - Math.exp(-dt * 14); // 탐지 간격 사이를 부드럽게 잇는다
+      for (const k of ["x", "y", "s"]) this._cur[k] += (this._goal[k] - this._cur[k]) * a;
     }
+    const H = this.container.clientHeight;
+    const W = this.container.clientWidth;
+    const k = (2 * DEPTH * Math.tan(((FOV / 2) * Math.PI) / 180)) / H; // 화면 px → 월드
+    this.anchor.position.set((this._cur.x - W / 2) * k, -(this._cur.y - H / 2) * k, -DEPTH);
+    this.anchor.scale.setScalar((this._cur.s * k) / CHAR_UNITS);
+    // 병 쪽을 살짝 바라보고, 위에서 내려다본 듯 약간 숙인다
+    this.anchor.rotation.set(0.12, -this._goal.side * 0.35, 0);
   }
 
   _loop() {
@@ -204,73 +225,41 @@ export class ArSession {
     const dt = Math.min(0.1, (now - this._lastT) / 1000);
     this._lastT = now;
     this.stats.renderFps = this.stats.renderFps * 0.9 + (dt > 0 ? 1 / dt : 0) * 0.1;
-    // 회전 등으로 카메라 해상도 방향이 바뀌면 추적기를 다시 만든다
-    if (this.video && this.controller && this.video.videoWidth &&
-        (this.video.videoWidth !== this.controller.inputWidth || this.video.videoHeight !== this.controller.inputHeight)) {
-      this._rebuild();
-    }
+    if (this.anchor.visible) this._applyAnchor(dt);
     this.cb.onFrame && this.cb.onFrame(now / 1000, dt);
     this.renderer.render(this.scene, this.camera);
   }
 
-  async _rebuild() {
-    if (this._rebuilding) return;
-    this._rebuilding = true;
-    this._disposeController();
-    if (this.anchorVisible) this._onUpdate({ type: "updateMatrix", worldMatrix: null });
-    await this._buildController();
-    this._rebuilding = false;
-  }
-
-  _disposeController() {
-    if (!this.controller) return;
-    try {
-      this.controller.stopProcessVideo();
-      this.controller.worker && this.controller.worker.terminate();
-    } catch {}
-    this.controller = null;
-  }
-
   resize() {
-    const { renderer, camera, container, video, controller } = this;
+    const { renderer, camera, container, video } = this;
     if (!video || !renderer) return;
     const cw = container.clientWidth;
     const ch = container.clientHeight;
     const vw0 = video.videoWidth;
     const vh0 = video.videoHeight;
     if (!cw || !ch || !vw0 || !vh0) return;
-
     // 비디오는 화면을 꽉 채우도록(cover) 배치한다
-    let vw, vh;
-    const videoRatio = vw0 / vh0;
-    const containerRatio = cw / ch;
-    if (videoRatio > containerRatio) {
+    let vw;
+    let vh;
+    if (vw0 / vh0 > cw / ch) {
       vh = ch;
-      vw = vh * videoRatio;
+      vw = vh * (vw0 / vh0);
     } else {
       vw = cw;
-      vh = vw / videoRatio;
+      vh = vw / (vw0 / vh0);
     }
     video.style.width = vw + "px";
     video.style.height = vh + "px";
     video.style.left = -(vw - cw) / 2 + "px";
     video.style.top = -(vh - ch) / 2 + "px";
-
-    renderer.setSize(cw, ch);
-    if (!controller) return;
-    // three 카메라의 시야각을 잘린 비디오에 맞춘다 (MindAR three.js 래퍼와 같은 식)
-    const proj = controller.getProjectionMatrix();
-    const fovAdjust = ch / vh;
-    camera.fov = (2 * Math.atan((1 / proj[5]) * fovAdjust) * 180) / Math.PI;
-    camera.near = proj[14] / (proj[10] - 1.0);
-    camera.far = proj[14] / (proj[10] + 1.0);
     camera.aspect = cw / ch;
     camera.updateProjectionMatrix();
+    renderer.setSize(cw, ch);
   }
 
   /** 화면 좌표(px) → 레이캐스트. 맞힌 첫 오브젝트 또는 null */
   hitTest(clientX, clientY, targets) {
-    if (!this.anchorVisible || !this.renderer) return null;
+    if (!this.anchor.visible || !this.renderer) return null;
     const rect = this.renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
     const ray = new THREE.Raycaster();
@@ -280,46 +269,25 @@ export class ArSession {
     return hits.length ? hits[0] : null;
   }
 
-  /** 앵커 로컬 좌표 점 → 화면 px (디버그·테스트용) */
-  project(local) {
+  /** 3D 오브젝트의 로컬 점 → 화면 px (디버그·테스트용) */
+  projectObject(obj, local = [0, 0, 0]) {
     if (!this.renderer) return null;
     this.scene.updateMatrixWorld(true);
-    const v = new THREE.Vector3(...local).applyMatrix4(this.anchor.matrixWorld).project(this.camera);
+    const v = new THREE.Vector3(...local).applyMatrix4(obj.matrixWorld).project(this.camera);
     const rect = this.renderer.domElement.getBoundingClientRect();
-    return { x: rect.left + ((v.x + 1) / 2) * rect.width, y: rect.top + ((1 - v.y) / 2) * rect.height, z: v.z };
+    return { x: rect.left + ((v.x + 1) / 2) * rect.width, y: rect.top + ((1 - v.y) / 2) * rect.height };
   }
 
-  /** 현재 비디오 프레임에서 화면 사각형(px) 부분을 잘라 캔버스로 (병 라벨 실험용) */
-  captureRegion(rect) {
-    const v = this.video;
-    if (!v) return null;
-    const scale = v.videoWidth / v.getBoundingClientRect().width;
-    const vr = v.getBoundingClientRect();
-    const sx = (rect.left - vr.left) * scale;
-    const sy = (rect.top - vr.top) * scale;
-    const sw = rect.width * scale;
-    const sh = rect.height * scale;
-    const c = document.createElement("canvas");
-    c.width = Math.round(sw);
-    c.height = Math.round(sh);
-    c.getContext("2d").drawImage(v, sx, sy, sw, sh, 0, 0, c.width, c.height);
-    return c;
-  }
-
-  /** 다른 타깃으로 교체 (실험 모드) */
-  async replaceTarget(buffer) {
-    this.targetBuffer = buffer;
-    if (!this.running) return;
-    this._disposeController();
-    if (this.anchorVisible) this._onUpdate({ type: "updateMatrix", worldMatrix: null });
-    await this._buildController();
+  /** 지금 추적 중인 병의 화면 박스(px, 컨테이너 기준) */
+  get bottleScreenBox() {
+    return this.tracker.showing && this.video ? this.videoBoxToScreen(this.tracker.box) : null;
   }
 
   /** 카메라를 완전히 해제한다. 여러 번 불러도 안전하다. */
   stop() {
+    this.running = false;
     cancelAnimationFrame(this._raf);
     this._raf = 0;
-    this._disposeController();
     window.removeEventListener("resize", this._onResize);
     this._ro && this._ro.disconnect();
     if (this.stream) {
@@ -336,9 +304,9 @@ export class ArSession {
       this.renderer.dispose();
       this.renderer = null;
     }
-    this.anchorVisible = false;
+    this.tracker.reset();
     this.anchor.visible = false;
-    this.running = false;
+    this._goal = this._cur = null;
   }
 
   get cameraActive() {
