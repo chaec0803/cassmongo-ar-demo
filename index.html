@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#0047bb">
+  <meta name="robots" content="noindex">
+  <title>카스몬고 AR 체험</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="css/app.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+<div id="app">
+
+  <!-- A. 시작 -->
+  <section id="screen-intro" class="screen intro" hidden>
+    <header class="topbar">
+      <span class="chip" id="intro-place">매장 정보 확인 중</span>
+      <button class="pill" data-open="dex">도감 <b class="dex-count">0/3</b></button>
+    </header>
+    <div class="intro-hero">
+      <div class="hero-thumbs" id="hero-thumbs"></div>
+      <h1>카스몬고<br>AR 체험</h1>
+      <p class="lead">테이블 위 카스몬고 카드를 카메라로 비추면<br>숨어 있던 캐릭터가 나타나요.</p>
+      <ol class="steps">
+        <li><b>1</b>카드 비추기</li>
+        <li><b>2</b>캐릭터 3번 터치</li>
+        <li><b>3</b>도감에 수집</li>
+      </ol>
+    </div>
+    <div class="intro-bottom">
+      <div class="notice warn" id="place-missing" hidden>
+        테이블 QR로 접속한 주소가 아니에요. 매장·테이블 정보 없이 기록돼요.
+        <a id="demo-default-link" href="?store_id=DEMO01&amp;table_id=T01">테스트 매장 주소로 열기</a>
+      </div>
+      <label class="adult">
+        <input type="checkbox" id="adult-check">
+        <span>만 19세 이상입니다</span>
+      </label>
+      <p class="fineprint">데모용 <b>자기 확인</b>입니다. 실제 본인·연령 인증을 하지 않아요.</p>
+      <button class="btn primary" id="btn-start" disabled>체험 시작</button>
+      <div class="intro-links">
+        <button class="link" id="btn-bottle">실험: 카스 병 라벨 인식</button>
+        <span>·</span>
+        <button class="link" data-open="log">참여 기록</button>
+        <span>·</span>
+        <a class="link" href="targets/cassmongo-table-target-A4.pdf" target="_blank" rel="noopener">타깃 카드 인쇄</a>
+      </div>
+      <p class="version" id="version">DEMO v1 · 실제 이벤트·주문과 연동되지 않음</p>
+    </div>
+  </section>
+
+  <!-- B-1. 카메라 사용 안내 (권한 요청 전) -->
+  <section id="screen-permission" class="screen permission" hidden>
+    <div class="perm-body">
+      <div class="perm-icon" aria-hidden="true">
+        <svg viewBox="0 0 48 48" width="56" height="56"><rect x="5" y="13" width="38" height="27" rx="6" fill="none" stroke="currentColor" stroke-width="3.5"/><path d="M17 13l3-5h8l3 5" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linejoin="round"/><circle cx="24" cy="26.5" r="7.5" fill="none" stroke="currentColor" stroke-width="3.5"/></svg>
+      </div>
+      <h2>카메라를 사용할게요</h2>
+      <ul class="perm-list">
+        <li>테이블 위 <b>카스몬고 카드</b>를 찾는 데만 써요.</li>
+        <li>카메라 영상은 이 휴대폰 안에서만 처리돼요. <b>서버로 보내거나 저장하지 않아요.</b></li>
+        <li>체험을 닫거나 다른 앱으로 나가면 카메라가 바로 꺼져요.</li>
+      </ul>
+      <p class="perm-hint">다음 화면에서 카메라 접근을 <b>‘허용’</b>해 주세요.</p>
+    </div>
+    <div class="bottom-actions">
+      <button class="btn primary" id="btn-camera">카메라 켜기</button>
+      <button class="btn ghost" data-go="intro">뒤로</button>
+    </div>
+  </section>
+
+  <!-- B-2 ~ D. AR -->
+  <section id="screen-ar" class="screen ar" hidden data-state="loading">
+    <div id="ar-stage" class="ar-stage"></div>
+    <div class="ar-hud">
+      <header class="topbar dark">
+        <button class="icon-btn" id="btn-close" aria-label="체험 닫기">
+          <svg viewBox="0 0 24 24" width="22" height="22"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/></svg>
+        </button>
+        <span class="chip glass" id="ar-place"></span>
+        <button class="pill glass" data-open="dex">도감 <b class="dex-count">0/3</b></button>
+      </header>
+
+      <div class="exp-banner" id="exp-banner" hidden>
+        실험 모드 · 카스 병 라벨 추적 시험<br><small>지정 이미지 인식과 별개 결과이며, 수집·기록 미션이 없습니다.</small>
+      </div>
+
+      <div class="scan-guide" id="scan-guide" aria-hidden="true">
+        <i class="c tl"></i><i class="c tr"></i><i class="c bl"></i><i class="c br"></i>
+        <div class="scan-line"></div>
+      </div>
+
+      <div class="status" id="status" aria-live="polite">
+        <div class="status-badge" id="status-badge"></div>
+        <div class="status-title" id="status-title"></div>
+        <div class="status-sub" id="status-sub"></div>
+        <div class="tap-dots" id="tap-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+        <div class="tips" id="scan-tips" hidden>
+          <b>인식이 잘 안 되나요?</b>
+          <ul>
+            <li>카드 <b>전체</b>가 화면에 들어오게 20~50cm 떨어져 비춰 주세요.</li>
+            <li>조명이 반사되면 각도를 살짝 바꿔 주세요.</li>
+            <li>어두우면 밝은 곳으로 옮겨 주세요.</li>
+            <li>테이블의 카스몬고 카드가 없다면 직원에게 요청하거나 <a href="targets/cassmongo-table-target.png" target="_blank" rel="noopener">카드 이미지</a>를 다른 화면에 띄워 비춰 보세요.</li>
+          </ul>
+        </div>
+        <div class="exp-panel" id="exp-panel" hidden></div>
+      </div>
+    </div>
+
+    <div class="sheet collect" id="collect-card" hidden>
+      <div class="collect-head"><span class="burst">획득!</span><span id="collect-dup"></span></div>
+      <div class="collect-row">
+        <img id="collect-img" alt="">
+        <div>
+          <h2 id="collect-name"></h2>
+          <p id="collect-desc"></p>
+          <p class="collect-count" id="collect-count"></p>
+        </div>
+      </div>
+      <button class="btn primary" id="btn-next">다음 탐험</button>
+      <button class="btn ghost" data-open="dex">도감 보기</button>
+    </div>
+
+    <div class="overlay center" id="ar-loading">
+      <div class="spinner"></div>
+      <p id="ar-loading-text">카메라 준비 중…</p>
+    </div>
+
+    <div class="overlay center dim" id="resume" hidden>
+      <p>화면을 벗어나서 카메라를 껐어요.</p>
+      <button class="btn primary" id="btn-resume">카메라 다시 켜기</button>
+      <button class="btn ghost light" id="btn-resume-exit">처음으로</button>
+    </div>
+  </section>
+
+  <!-- 오류 -->
+  <section id="screen-error" class="screen error" hidden>
+    <div class="err-body">
+      <div class="err-icon" aria-hidden="true">!</div>
+      <h2 id="err-title"></h2>
+      <p id="err-desc"></p>
+      <ol id="err-steps"></ol>
+      <p class="err-code" id="err-code"></p>
+    </div>
+    <div class="bottom-actions">
+      <button class="btn primary" id="btn-retry">다시 시도</button>
+      <button class="btn ghost" id="btn-copy-url" hidden>주소 복사</button>
+      <button class="btn ghost" data-go="intro">처음으로</button>
+    </div>
+  </section>
+
+  <!-- 도감 -->
+  <div class="modal" id="modal-dex" hidden>
+    <div class="modal-card">
+      <header class="modal-head"><h2>카스몬고 도감</h2><button class="icon-btn" data-close aria-label="닫기">✕</button></header>
+      <p class="dex-summary" id="dex-summary"></p>
+      <div class="dex-grid" id="dex-grid"></div>
+      <p class="fineprint">수집 기록은 <b>이 브라우저에만</b> 저장되는 데모 기록이에요. 다른 기기와 공유되지 않고, 브라우저 데이터를 지우면 사라져요.</p>
+      <button class="btn ghost" data-open="log">참여 기록 보기</button>
+    </div>
+  </div>
+
+  <!-- 참여 기록 -->
+  <div class="modal" id="modal-log" hidden>
+    <div class="modal-card wide">
+      <header class="modal-head"><h2>참여 기록 (데모)</h2><button class="icon-btn" data-close aria-label="닫기">✕</button></header>
+      <div class="notice">
+        <b>기록 범위:</b> 이 기기·이 브라우저의 localStorage 에만 저장됩니다. <b>서버로 전송·저장하지 않으며</b>, 다른 기기의 참여는 보이지 않습니다.
+        카메라 영상·사진은 기록하지 않습니다. 구매 인증이나 POS·주문 데이터와 무관합니다.
+      </div>
+      <div class="log-summary" id="log-summary"></div>
+      <div class="log-actions">
+        <button class="btn small primary" id="btn-log-download">JSON 다운로드</button>
+        <select id="log-filter" aria-label="이벤트 필터"><option value="">전체 이벤트</option></select>
+      </div>
+      <div class="log-list" id="log-list"></div>
+    </div>
+  </div>
+
+  <!-- 디버그 (?debug=1 또는 하단 버전 문구 5번 탭) -->
+  <div class="debug" id="debug" hidden>
+    <pre id="debug-text"></pre>
+    <div class="debug-actions">
+      <button id="btn-debug-reset">데모 데이터 초기화</button>
+      <button id="btn-debug-hide">숨기기</button>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+</div>
+<noscript>이 체험은 JavaScript 가 필요합니다.</noscript>
+</body>
+</html>

@@ -1,0 +1,41 @@
+{
+  "base": "https://chaec0803.github.io/cassmongo-ar-demo/",
+  "items": [
+    {
+      "store_id": "DEMO01",
+      "table_id": "T01",
+      "url": "https://chaec0803.github.io/cassmongo-ar-demo/?store_id=DEMO01&table_id=T01",
+      "file": "DEMO01-T01.png"
+    },
+    {
+      "store_id": "DEMO01",
+      "table_id": "T02",
+      "url": "https://chaec0803.github.io/cassmongo-ar-demo/?store_id=DEMO01&table_id=T02",
+      "file": "DEMO01-T02.png"
+    },
+    {
+      "store_id": "DEMO01",
+      "table_id": "T03",
+      "url": "https://chaec0803.github.io/cassmongo-ar-demo/?store_id=DEMO01&table_id=T03",
+      "file": "DEMO01-T03.png"
+    },
+    {
+      "store_id": "DEMO01",
+      "table_id": "T04",
+      "url": "https://chaec0803.github.io/cassmongo-ar-demo/?store_id=DEMO01&table_id=T04",
+      "file": "DEMO01-T04.png"
+    },
+    {
+      "store_id": "DEMO02",
+      "table_id": "T01",
+      "url": "https://chaec0803.github.io/cassmongo-ar-demo/?store_id=DEMO02&table_id=T01",
+      "file": "DEMO02-T01.png"
+    },
+    {
+      "store_id": "DEMO02",
+      "table_id": "T02",
+      "url": "https://chaec0803.github.io/cassmongo-ar-demo/?store_id=DEMO02&table_id=T02",
+      "file": "DEMO02-T02.png"
+    }
+  ]
+}
